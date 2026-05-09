@@ -6,10 +6,14 @@ import pygame
 import os
 import shutil
 import subprocess
+import time
+import csv
 
 image_folder = os.path.abspath("images")
 output_folder = os.path.abspath("output")
 pipeline = 'photogrammetryDraft'
+ENABLE_LOGGING = False
+interrupt = False
 
 # Remove old dirs (if present) then recreate empty
 for p in (image_folder, output_folder):
@@ -20,85 +24,115 @@ for p in (image_folder, output_folder):
             print(f"Failed to remove {p}: {e}")
     os.makedirs(p, exist_ok=True)
 
-photogrammetryProc = None
-def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-    """Run a command and return (returncode, stdout, stderr)."""
-    global photogrammetryProc
-    try:
-        photogrammetryProc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        out, err = photogrammetryProc.communicate()
-        return photogrammetryProc.returncode, out.strip(), err.strip()
-    except Exception as e:
-        return -1, "", str(e)
+model = YOLO("best.pt")
+
+# Camera Setup
 
 class Frame:
     def __init__(self):
         self.frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
         self.lock = threading.Lock()
-    def set(self, frame):
+        self.last_update = time.time()
+        self.latency = time.time()
+
+    def set(self, frame, start_time):
         with self.lock:
             self.frame = frame.copy()
+            self.latency = start_time
+
     def get(self):
         with self.lock:
-            return self.frame.copy()
+            return self.frame.copy(), self.latency
 
-res = (1920, 1080)
-res2 = (res[0]//3, res[1]//3)
+def telemetry_logger(frame_list, filename="vision_performance.csv"):
+    print(f"[Telemetry] Logging started. Saving to {filename}")
+    
+    with open(filename, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "Cam0_Latency", "Cam1_Latency", "Cam2_Latency", "Cam3_Latency"])
+
+    while not interrupt:
+        time.sleep(10)
+        timestamp = time.strftime("%H:%M:%S")
+        now = time.time()
+        current_latencies = [now - f.get()[1] for f in frame_list]
+        
+        with open(filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp] + current_latencies)
+            
+    print("[Telemetry] Logging stopped.")
+
 def combine(imgs):
-    global res, res2
-    img1 = cv2.resize(imgs[0], res)
-    img2 = cv2.resize(imgs[1], res2)
-    img3 = cv2.resize(imgs[2], res2)
-    # img4 = cv2.resize(imgs[3], res2)
-    img4 = img3
+    img1 = cv2.resize(imgs[0], (1920, 1080))
+    img2 = cv2.resize(imgs[1], (640, 360))
+    img3 = cv2.resize(imgs[2], (640, 360))
+    img4 = cv2.resize(imgs[3], (640, 360))
     img5 = cv2.hconcat([img2, img3, img4])
     return cv2.vconcat([img1, img5])
 
-interrupt = False
-model = YOLO("best.pt")
-
-def run_camera(url, frame, model=None):
+def run_camera(url, frame_obj, model=None, camera_id=0):
     global interrupt
-    try:
+    retry_count = 0
+
+    while not interrupt:
+        print(f"[Executive] Initializing Stream {camera_id}...")
+
+        wait_time = min(retry_count * 2, 10) 
+        if retry_count > 0:
+            print(f"[Executive] Retry {retry_count} for Stream {camera_id} in {wait_time}s...")
+            time.sleep(wait_time)
+
         video = cv2.VideoCapture(url)
+        
+        last_heartbeat = time.time()
+        timeout_threshold = 2.0  # If no frames for 2 seconds, it's a "Stall"
+
         while not interrupt:
+            start_time = time.time() if ENABLE_LOGGING else 0
             r, f = video.read()
-            if not r or f is None:
-                continue
-            if model is None:
-                frame.set(f)
-            else:
-                results = model.predict(f)
-                plotted = results[0].plot()
+            
+            if r and f is not None:
+                last_heartbeat = time.time()
+                
+                if model and camera_id == 0:
+                    results = model.predict(f, verbose=False)
+                    f = results[0].plot()
 
-                # Count Crabs on Upper Left Corner
-                number = len(results[0].boxes)
-                cv2.putText(plotted, f"Green Crabs Detected: {number}", (7, 70), 
-                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+                    # Count Crabs on Upper Left Corner
+                    number = len(results[0].boxes)
+                    cv2.putText(f, f"Green Crabs Detected: {number}", (7, 70), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+                
+                frame_obj.set(f, start_time)
 
-                frame.set(plotted)
+            if (time.time() - last_heartbeat) > timeout_threshold:
+                print(f"[Watchdog] Stream {camera_id} HEARTBEAT LOST. Auto-Recovering...")
+                break 
+                
         video.release()
-    except Exception as e:
-        print(f"ERROR: {e}")
+        time.sleep(1) 
+        retry_count += 1
 
+# Photogrammetry & Controller
+photogrammetryProc = None
 controller = None
+generating = False
+numPictures = 0
+
 def connect_controller():
     global controller
     if pygame.joystick.get_count() > 0 and controller is None:
         controller = pygame.joystick.Joystick(0)
         controller.init()
-        print(f'Controller connected: {controller.get_name()}')
+        print(f'[System] Controller connected: {controller.get_name()}')
     elif pygame.joystick.get_count() == 0 and controller is not None:
-        print('Controller disconnected')
+        print('[System] Controller disconnected')
         controller = None
 
-generating = False
-numPictures = 0
 def run_photogrammetry():
-    global generating, numPictures, photogrammetryProc
-
+    global generating, photogrammetryProc
     generating = True
-
     cmd = [
         "./meshroom_batch",
         "-i", image_folder,
@@ -114,93 +148,124 @@ def run_photogrammetry():
             text=True,
             bufsize=1
         )
-
         photogrammetryProc = proc
 
         for line in proc.stdout:
             print(line, end="")      # terminal
             logfile.write(line)      # file
-
         ret = proc.wait()
 
     photogrammetryProc = None
-
     if ret == 0:
-        print("PHOTOGRAMMETRY FINISHED")
+        print("[System] PHOTOGRAMMETRY FINISHED")
     elif ret != -9:
-        print(f"Photogrammetry exited with code {ret}")
+        print(f"[System] Photogrammetry exited with code {ret}")
 
     generating = False
 
-
+# Threads
 frames = []
 threads = []
+
+# Change depending on amount of cameras available
 urls = [
     "udp://192.168.2.1:50000?fifo_size=1000000&overrun_nonfatal=1",
-    "udp://192.168.2.1:50001?overrun_nonfatal=1", 
-    0,
-    # "udp://192.168.2.1:1986?overrun_nonfatal=1", 
-    # "udp://192.168.2.1:1987?overrun_nonfatal=1",
+    "udp://192.168.2.1:50001?fifo_size=1000000&overrun_nonfatal=1",
+    "udp://192.168.2.1:50002?fifo_size=1000000&overrun_nonfatal=1",
+    "udp://192.168.2.1:50002?fifo_size=1000000&overrun_nonfatal=1",
 ]
 
 for i in range(len(urls)):
     frames.append(Frame())
-    if i == 0:
-        threads.append(threading.Thread(target=run_camera, args=(urls[i], frames[i], model)))
-    else:
-        threads.append(threading.Thread(target=run_camera, args=(urls[i], frames[i])))
+    target_model = model if i == 0 else None
+    threads.append(threading.Thread(target=run_camera, args=(urls[i], frames[i], target_model, i)))
+    threads[i].daemon = True 
     threads[i].start()
+
+log_thread = None
+if ENABLE_LOGGING:
+    log_thread = threading.Thread(target=telemetry_logger, args=(frames,))
+    log_thread.daemon = True
+    log_thread.start()
+
+print("[System] All Vision Threads Active.")
+
+# Set up UI / Controllers
+pygame.init()
+pygame.joystick.init()
+connect_controller()
+if controller is None:
+    print("[System] No controller connected. Plug in a controller to use photogrammetry")
 
 pictureWasPressed = True
 generateWasPressed = True
 photogrammetryThread = None
 
-pygame.init()
-pygame.joystick.init()
-connect_controller()
-if controller is None:
-    print("No controller connected\nPlug in a controller to use photogrammetry")
-while not interrupt:
-    try:
-        imgs = [f.get() for f in frames]
-        combined = combine(imgs)
-        cv2.imshow('Frontend', combined)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+# Main Loop
+try:
+    while not interrupt:
+        raw_data = [f.get() for f in frames]
+        imgs = [data[0] for data in raw_data]
+
+        if len(imgs) == 4:
+            combined = combine(imgs)
+            
+            # Latency Overlay 
+            if ENABLE_LOGGING: 
+                current_latencies = [time.time() - data[1] for data in raw_data]
+                cv2.putText(combined, f"Latency: {current_latencies[0]:.3f}s", (7, 130), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            
+            cv2.imshow('Slugbotics Topside', combined)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'): 
             interrupt = True
+            
         pygame.event.pump()
         connect_controller()
         if controller is not None:
-            picture = bool(controller.get_button(0)) # A
-            generate = bool(controller.get_button(1)) # B
+            picture = bool(controller.get_button(0))   # A Button
+            generate = bool(controller.get_button(1))  # B Button
+            
             if picture and not pictureWasPressed:
-                print(f"image saved in img{numPictures}")
+                print(f"[System] Image saved in images/img{numPictures}.png")
                 cv2.imwrite(f'images/img{numPictures}.png', imgs[0])
-
-                print(f'Saved image {numPictures}')
                 numPictures += 1
+                
             if generate and not generateWasPressed:
                 if generating:
-                    print('Photogrammetry is already running')
+                    print('[System] Photogrammetry is already running')
                 else:
                     photogrammetryThread = threading.Thread(target=run_photogrammetry)
                     photogrammetryThread.start()
+                    
             pictureWasPressed, generateWasPressed = picture, generate
-            
-    except KeyboardInterrupt:
-        print("Got KeyboardInterrupt")
 
-        interrupt = True
-    except Exception as e:
-        print(f'ERROR: {e}')
-        interrupt = True
+except KeyboardInterrupt:
+    print("\n[System] User-initiated interrupt (Ctrl+C). Shutting down...")
 
-interrupt = True
-for t in threads:
-    t.join()
-if photogrammetryThread is not None and photogrammetryThread.is_alive():
-    if photogrammetryProc:
-        photogrammetryProc.kill()
-    photogrammetryThread.join()
-cv2.destroyAllWindows()
-pygame.quit()
-print()
+except Exception as e:
+    print(f'[CRITICAL ERROR] {e}')
+
+# Cleanup & Shutdown
+finally: 
+    interrupt = True
+    print("[System] Shutdown signaled. Beginning exit.")
+
+    for i, t in enumerate(threads):
+        t.join(timeout=2.0) 
+        print(f"[System] Video Stream {i} released.")
+
+    if photogrammetryThread is not None and photogrammetryThread.is_alive():
+        if photogrammetryProc:
+            print("[System] Killing background photogrammetry process...")
+            photogrammetryProc.kill()
+        photogrammetryThread.join(timeout=2.0)
+
+    if log_thread:
+        log_thread.join(timeout=2.0)
+        print("[System] Telemetry data flushed to disk.")
+
+    cv2.destroyAllWindows()
+    pygame.quit()
+    print("[System] Exit complete.\n")
