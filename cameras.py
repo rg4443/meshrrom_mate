@@ -11,6 +11,10 @@ import csv
 
 image_folder = os.path.abspath("images")
 output_folder = os.path.abspath("output")
+
+# Cache for debugging purposes, will be removed once photogrammetry is completed.
+cache_folder = os.path.abspath("cache")
+os.makedirs(cache_folder, exist_ok=True)
 pipeline = 'photogrammetryDraft'
 ENABLE_LOGGING = False
 interrupt = False
@@ -133,11 +137,26 @@ def connect_controller():
 def run_photogrammetry():
     global generating, photogrammetryProc
     generating = True
+
+    # Get absolute paths (Required for Docker on macOS)
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    pipeline_path = os.path.join(base_path, "draft_pipeline.mg")
+
+    if not os.path.isfile(pipeline_path):
+        print(f"[ERROR] Could not find pipeline file at: {pipeline_path}")
+        return
+
     cmd = [
-        "./meshroom_batch",
-        "-i", image_folder,
-        "-o", output_folder,
-        "--pipeline", pipeline
+        "docker", "run", "--rm",
+        "-v", f"{image_folder}:/input",
+        "-v", f"{output_folder}:/output",
+        "-v", f"{pipeline_path}:/pipeline.mg", 
+        "-v", f"{cache_folder}:/tmp/MeshroomCache",
+        "alicevision/meshroom:2025.1.0-av3.3.0-ubuntu22.04-cuda12.1.1",
+        "/opt/Meshroom_bundle/meshroom_batch", 
+        "--input", "/input", 
+        "--output", "/output", 
+        "--pipeline", "/pipeline.mg" 
     ]
 
     with open("photogrammetry.log", "w") as logfile:
@@ -229,7 +248,15 @@ try:
             
             if picture and not pictureWasPressed:
                 print(f"[System] Image saved in images/img{numPictures}.png")
-                cv2.imwrite(f'images/img{numPictures}.png', imgs[0])
+                filename = os.path.join(image_folder, f'img{numPictures}.jpg')
+
+                # Jpeg for Meshroom
+                success = cv2.imwrite(filename, imgs[0], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+            
+                if success:
+                    print(f"[System] Image successfully saved: {filename}")
+                else:
+                    print(f"[ERROR] Failed to save image to: {filename}. Check folder permissions.")
                 numPictures += 1
                 
             if generate and not generateWasPressed:
