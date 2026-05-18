@@ -2,7 +2,6 @@ import cv2
 from ultralytics import YOLO
 import threading
 import numpy as np
-import pygame
 import os
 import shutil
 import subprocess
@@ -154,21 +153,10 @@ def run_camera(url, frame_obj, camera_id=0):
         time.sleep(1) 
         retry_count += 1
 
-# Photogrammetry & Controller
+# Photogrammetry Controls
 photogrammetryProc = None
-controller = None
 generating = False
 numPictures = 0
-
-def connect_controller():
-    global controller
-    if pygame.joystick.get_count() > 0 and controller is None:
-        controller = pygame.joystick.Joystick(0)
-        controller.init()
-        print(f'[System] Controller connected: {controller.get_name()}')
-    elif pygame.joystick.get_count() == 0 and controller is not None:
-        print('[System] Controller disconnected')
-        controller = None
 
 def run_photogrammetry():
     global generating, photogrammetryProc
@@ -197,10 +185,9 @@ def run_photogrammetry():
         photogrammetryProc = proc
 
         for line in proc.stdout:
-            print(line, end="")      # terminal
-            logfile.write(line)      # file
+            print(line, end="")      
+            logfile.write(line)      
         ret = proc.wait()
-
 
     photogrammetryProc = None
     if ret == 0:
@@ -208,17 +195,14 @@ def run_photogrammetry():
     else:
         print(f"[System] Photogrammetry exited with code {ret}")
 
+    generating = False
+
 # Threads
 frames = []
 threads = []
 
 # Change depending on amount of cameras available
-urls = [
-    "udp://192.168.2.1:50000?fifo_size=1000000&overrun_nonfatal=1",
-    "udp://192.168.2.1:50001?fifo_size=1000000&overrun_nonfatal=1",
-    "udp://192.168.2.1:50002?fifo_size=1000000&overrun_nonfatal=1",
-    "udp://192.168.2.1:50003?fifo_size=1000000&overrun_nonfatal=1",
-]
+urls = [0, 0, 0, 0]
 
 for i in range(len(urls)):
     frames.append(Frame())
@@ -241,16 +225,8 @@ if ENABLE_LOGGING:
     log_thread.start()
 
 print("[System] All Vision Threads Active.")
+print("[System] Controls: 'p' = Take Picture | 'g' = Start Photogrammetry | 'q' = Quit")
 
-# Set up UI / Controllers
-pygame.init()
-pygame.joystick.init()
-connect_controller()
-if controller is None:
-    print("[System] No controller connected. Plug in a controller to use photogrammetry")
-
-pictureWasPressed = True
-generateWasPressed = True
 photogrammetryThread = None
 
 # Main Loop
@@ -269,37 +245,32 @@ try:
             
             cv2.imshow('Slugbotics Topside', combined)
         
+        # Capture keystroke (OpenCV window MUST be in focus)
         key = cv2.waitKey(1) & 0xFF
+        
         if key == ord('q'): 
             interrupt = True
             
-        pygame.event.pump()
-        connect_controller()
-        if controller is not None:
-            picture = bool(controller.get_button(0))   # A Button
-            generate = bool(controller.get_button(1))  # B Button
-            
-            if picture and not pictureWasPressed:
-                print(f"[System] Image saved in images/img{numPictures}.png")
-                filename = os.path.join(image_folder, f'img{numPictures}.jpg')
+        elif key == ord('p'):  # 'p' replaces the 'A' button
+            print(f"[System] Image saved in images/img{numPictures}.png")
+            filename = os.path.join(image_folder, f'img{numPictures}.jpg')
 
-                # Jpeg for Meshroom
-                success = cv2.imwrite(filename, imgs[0], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+            # Jpeg for Meshroom
+            success = cv2.imwrite(filename, imgs[0], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+        
+            if success:
+                print(f"[System] Image successfully saved: {filename}")
+            else:
+                print(f"[ERROR] Failed to save image to: {filename}. Check folder permissions.")
+            numPictures += 1
             
-                if success:
-                    print(f"[System] Image successfully saved: {filename}")
-                else:
-                    print(f"[ERROR] Failed to save image to: {filename}. Check folder permissions.")
-                numPictures += 1
-                
-            if generate and not generateWasPressed:
-                if generating:
-                    print('[System] Photogrammetry is already running')
-                else:
-                    photogrammetryThread = threading.Thread(target=run_photogrammetry)
-                    photogrammetryThread.start()
-                    
-            pictureWasPressed, generateWasPressed = picture, generate
+        elif key == ord('g'):  # 'g' replaces the 'B' button
+            if generating:
+                print('[System] Photogrammetry is already running')
+            else:
+                print('[System] Spinning up Photogrammetry Thread...')
+                photogrammetryThread = threading.Thread(target=run_photogrammetry)
+                photogrammetryThread.start()
 
 except KeyboardInterrupt:
     print("\n[System] User-initiated interrupt (Ctrl+C). Shutting down...")
@@ -327,5 +298,4 @@ finally:
         print("[System] Telemetry data flushed to disk.")
 
     cv2.destroyAllWindows()
-    pygame.quit()
     print("[System] Exit complete.\n")
