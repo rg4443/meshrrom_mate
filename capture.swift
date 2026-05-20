@@ -22,8 +22,8 @@ struct ObjectCaptureCLI {
         print("[Native Capture] Initializing Apple Object Capture session...")
         let session = try PhotogrammetrySession(input: inputFolder)
         
-        print("[Native Capture] Processing photos (Preview quality)...")
-        try session.process(requests: [.modelFile(url: outputFile, detail: .preview)])
+        print("[Native Capture] Processing photos (medium quality)...")
+        try session.process(requests: [.modelFile(url: outputFile, detail: .medium)])
         
         // Fixed: Added 'try' here because session.outputs can throw errors
         for try await output in session.outputs {
